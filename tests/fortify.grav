@@ -1,0 +1,153 @@
+// apogee-fortify's tests: the flows through the router, a session and an
+// Orbit user on SQLite — registration and email verification by signed link,
+// login (and its throttle), password reset, two-factor setup, sign-in with a
+// code and with a recovery code (each good once), and changing the password.
+import "std"
+import "apogee-container"
+import "apogee-http"
+import "apogee-routing"
+import "apogee-session"
+import "apogee-auth"
+import "apogee-crypt"
+import "apogee-testing"
+import "grav-orbit"
+import "../src/all.grav"
+use apogee.*
+use orbit.*
+
+class User extends Model implements Authenticatable {
+    public id: long = 0
+    public name: string = ""
+    public email: string = ""
+    public password: string = ""
+    public emailVerifiedAt: DateTime? = null
+    public twoFactor: string = ""
+    constructor() {}
+    fn authId() -> string { return str(self.id) }
+    fn authPassword() -> string { return self.password }
+}
+
+// What the session guard asks for: users by id (Fortify finds them).
+class Users implements UserProvider {
+    constructor() {}
+    fn retrieveById(id: string) -> any { return Fortify.users.findById(id) }
+    fn retrieveByCredentials(credentials: HashMap<string, any>) -> any { return Fortify.users.findByEmail(str(credentials.get("email"))) }
+    fn validateCredentials(user: any, credentials: HashMap<string, any>) -> bool { return Passwords.check(str(credentials.get("password")), (user as User).password) }
+    fn retrieveByToken(id: string, token: string) -> any { return null }
+    fn updateRememberToken(user: any, token: string) {}
+}
+
+class Sent { static links: Array<string> = new Array<string>() }
+
+fn app() -> TestClient {
+    let file = Dir.temp() + "/fortify_test_" + str(Process.pid()) + ".sqlite"
+    new File(file).delete()
+    DB.connect(Sqlite.open(file))
+    User.createTable()
+    Crypt.setKey("base64:" + Base64.encodeBytes(Crypto.randomBytes(32)))
+    Passwords.iterations = 1000
+    Fortify.users = new ModelUsers(reflect(User))
+    Fortify.broker = new PasswordBroker(new MemoryResetTokenStore())
+    Fortify.limiter = new RateLimiter()
+    Fortify.sendResetLink = fn(user: any, url: string) { Sent.links.push(url) }
+    Fortify.sendVerificationLink = fn(user: any, url: string) { Sent.links.push(url) }
+    let auth = new AuthManager(new Gate())
+    auth.addGuard(new SessionGuard("web", new Users(), new CookieJar("k")))
+    Fortify.auth = auth
+    let r = new Router(new Container())
+    r.signingKey = "signing-key"
+    Request.userResolver = fn(req: Request) -> any { return auth.guard().user(req) }
+    r.aliasInstance("session", new StartSession(new SessionManager(new MemorySessionStore(), "k")))
+    r.aliasMiddleware("auth", fn(a: Array<string>) -> Middleware { return new Authenticate(auth, a) })
+    r.aliasInstance("guest", new RedirectIfAuthenticated(auth, "/home"))
+    r.middleware(["session"]).group(fn(g: Router) {
+        Fortify.routes(g)
+        g.get("/me", fn(req: Request) -> Response { return Response.json({"email": req.user == null ? "" : (req.user as User).email}) })
+        g.get("/billing", fn(req: Request) -> Response { return Response.json({"ok": true}) }).middleware(["auth", "verified", "password.confirm"])
+    })
+    return new TestClient(new HttpKernel(r))
+}
+
+fn last() -> string { return Sent.links[Sent.links.size() - 1] }
+
+test "registration, and email verification by signed link" {
+    let c = app()
+    c.postJson("/register", {"name": "Ada", "email": "Ada@Example.test", "password": "correct horse", "password_confirmation": "correct horse"}).assertStatus(201)
+    c.getJson("/me").assertJsonPath("email", "ada@example.test")
+    c.postJson("/register", {"name": "Ada", "email": "ada@example.test", "password": "x", "password_confirmation": "y"}).assertStatus(409)   // signed in: guests only
+    c.postJson("/logout", null)
+    c.postJson("/register", {"name": "Ada", "email": "ada@example.test", "password": "another one", "password_confirmation": "another one"}).assertUnprocessable()
+    c.postJson("/login", {"email": "ada@example.test", "password": "correct horse"}).assertOk()
+    let link = last()
+    assert(Str.contains(link, "/email/verify/") && Str.contains(link, "signature="))
+    c.getJson("/billing").assertStatus(403)                                  // not verified yet
+    c.getJson(link + "x").assertStatus(403)                                  // tampered
+    c.getJson(link).assertOk().assertJsonPath("verified", true)
+    assert((Fortify.users.findByEmail("ada@example.test") as User).emailVerifiedAt != null)
+    c.getJson("/billing").assertStatus(423)                                  // verified, but no recent password confirmation
+    c.postJson("/user/confirm-password", {"password": "wrong"}).assertUnprocessable()
+    c.postJson("/user/confirm-password", {"password": "correct horse"}).assertStatus(201)
+    c.getJson("/billing").assertOk()
+}
+
+test "login, its throttle, and logout" {
+    let c = app()
+    c.postJson("/register", {"name": "Bob", "email": "bob@example.test", "password": "secret pass", "password_confirmation": "secret pass"})
+    c.postJson("/logout", null).assertOk()
+    c.getJson("/me").assertJsonPath("email", "")
+    c.postJson("/login", {"email": "bob@example.test", "password": "nope"}).assertUnprocessable()
+    c.postJson("/login", {"email": "BOB@example.test", "password": "secret pass"}).assertOk().assertJsonPath("two_factor", false)
+    c.getJson("/me").assertJsonPath("email", "bob@example.test")
+    c.postJson("/logout", null)
+    for (i in 0..5) { c.postJson("/login", {"email": "bob@example.test", "password": "nope"}) }
+    let r = c.postJson("/login", {"email": "bob@example.test", "password": "secret pass"}).assertUnprocessable()
+    assert(Str.contains(r.http.body(), "Too many sign-in attempts"))
+}
+
+test "password reset by email" {
+    let c = app()
+    c.postJson("/register", {"name": "Cy", "email": "cy@example.test", "password": "first pass", "password_confirmation": "first pass"})
+    c.postJson("/logout", null)
+    let before = Sent.links.size()
+    c.postJson("/forgot-password", {"email": "nobody@example.test"}).assertOk().assertJsonPath("status", "sent")   // the same answer
+    assertEq(Sent.links.size(), before)
+    c.postJson("/forgot-password", {"email": "cy@example.test"}).assertOk()
+    let link = last()
+    let token = Str.before(Str.after(link, "/reset-password/"), "?")
+    c.postJson("/forgot-password", {"email": "cy@example.test"}).assertOk()
+    assertEq(Sent.links.size(), before + 1)                                  // throttled: no second email
+    c.postJson("/reset-password", {"token": "wrong", "email": "cy@example.test", "password": "new password", "password_confirmation": "new password"}).assertUnprocessable()
+    c.postJson("/reset-password", {"token": token, "email": "cy@example.test", "password": "new password", "password_confirmation": "new password"}).assertOk()
+    c.postJson("/reset-password", {"token": token, "email": "cy@example.test", "password": "again pass", "password_confirmation": "again pass"}).assertUnprocessable()
+    c.postJson("/login", {"email": "cy@example.test", "password": "new password"}).assertOk()
+}
+
+test "two-factor setup and sign-in with codes" {
+    let c = app()
+    c.postJson("/register", {"name": "Di", "email": "di@example.test", "password": "pass words", "password_confirmation": "pass words"})
+    c.postJson("/user/two-factor-authentication", null).assertStatus(423)   // confirm the password first
+    c.postJson("/user/confirm-password", {"password": "pass words"})
+    let on = c.postJson("/user/two-factor-authentication", null).assertOk()
+    let secret = on.jsonAt("secret").asString()
+    assert(Str.startsWith(on.jsonAt("otpauth_url").asString(), "otpauth://totp/Apogee:di%40example.test?secret=" + secret))
+    let codes = on.jsonAt("recovery_codes")
+    assertEq(codes.size(), 8)
+    let stored = (Fortify.users.findByEmail("di@example.test") as User).twoFactor
+    assert(!Str.contains(stored, secret) && !Str.contains(stored, codes.at(0).asString()))   // encrypted, and hashed
+    c.postJson("/user/confirmed-two-factor-authentication", {"code": "000000"}).assertUnprocessable()
+    c.postJson("/user/confirmed-two-factor-authentication", {"code": Totp.now(secret)}).assertOk()
+    c.postJson("/logout", null)
+    // the password alone is not enough now
+    c.postJson("/login", {"email": "di@example.test", "password": "pass words"}).assertOk().assertJsonPath("two_factor", true)
+    c.getJson("/me").assertJsonPath("email", "")
+    c.postJson("/two-factor-challenge", {"code": Totp.now(secret)}).assertUnprocessable()   // used at confirmation: good once
+    c.postJson("/two-factor-challenge", {"recovery_code": codes.at(0).asString()}).assertOk()
+    c.getJson("/me").assertJsonPath("email", "di@example.test")
+    c.postJson("/logout", null)
+    c.postJson("/login", {"email": "di@example.test", "password": "pass words"})
+    c.postJson("/two-factor-challenge", {"recovery_code": codes.at(0).asString()}).assertUnprocessable()   // used up
+    c.postJson("/two-factor-challenge", {"recovery_code": codes.at(1).asString()}).assertOk()
+    // and changing the password
+    c.putJson("/user/password", {"current_password": "wrong", "password": "brand new", "password_confirmation": "brand new"}).assertUnprocessable()
+    c.putJson("/user/password", {"current_password": "pass words", "password": "brand new", "password_confirmation": "brand new"}).assertOk()
+}
