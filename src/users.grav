@@ -1,0 +1,110 @@
+// users.grav — how Fortify reads and changes users: the FortifyUsers
+// interface, and ModelUsers, which does it for an Orbit model by its fields
+// (email, password, emailVerifiedAt, and the two-factor columns).
+import "std"
+import "grav-orbit"
+use orbit.*
+
+namespace apogee {
+
+    // A user's two-factor state: the (encrypted) secret, the recovery code
+    // hashes, when it was confirmed (0: not yet), and the last time step used.
+    class TwoFactorState {
+        public secret: string = ""
+        public recoveryHashes: Array<string> = new Array<string>()
+        public confirmedAt: long = 0
+        public lastStep: long = -1
+        constructor() {}
+        fn enabled() -> bool { return self.secret != "" && self.confirmedAt > 0; }
+        fn toJson() -> string {
+            let o = Json.object();
+            o.set("secret", self.secret);
+            let a = Json.array();
+            for (h in self.recoveryHashes) { a.push(h); }
+            o.set("recovery", a);
+            o.set("confirmedAt", self.confirmedAt);
+            o.set("lastStep", self.lastStep);
+            return o.toJson();
+        }
+        static fn fromJson(text: string) -> TwoFactorState {
+            let s = new TwoFactorState();
+            let j = Json.tryParse(text);
+            if (j == null || !j.isObject()) { return s; }
+            s.secret = j.getString("secret", "");
+            if (j.has("recovery")) { for (h in j.get("recovery").asArray()) { s.recoveryHashes.push(h.asString()); } }
+            s.confirmedAt = j.has("confirmedAt") ? j.get("confirmedAt").asLong() : 0;
+            s.lastStep = j.has("lastStep") ? j.get("lastStep").asLong() : -1;
+            return s;
+        }
+    }
+
+    interface FortifyUsers {
+        // A new user from the validated registration input (name, email, password hash).
+        fn create(input: HashMap<string, any>, passwordHash: string) -> any
+        fn findByEmail(email: string) -> any
+        fn findById(id: string) -> any
+        fn email(user: any) -> string
+        fn passwordHash(user: any) -> string
+        fn setPasswordHash(user: any, hash: string)
+        fn emailVerified(user: any) -> bool
+        fn markEmailVerified(user: any)
+        fn twoFactor(user: any) -> TwoFactorState
+        fn saveTwoFactor(user: any, state: TwoFactorState)
+    }
+
+    // FortifyUsers over an Orbit model with the fields `email`, `password`,
+    // `emailVerifiedAt` (DateTime?) and `twoFactor` (string: the state as JSON;
+    // add the column to use two-factor sign-in). Field names can be changed.
+    class ModelUsers implements FortifyUsers {
+        public emailField: string = "email"
+        public passwordField: string = "password"
+        public verifiedField: string = "emailVerifiedAt"
+        public twoFactorField: string = "twoFactor"
+        public nameField: string = "name"
+        private info: ClassInfo
+        constructor(info: ClassInfo) { self.info = info; }
+
+        fn create(input: HashMap<string, any>, passwordHash: string) -> any {
+            let m = self.info.create() as Model;
+            if (self.info.field(self.nameField) != null && input.containsKey("name")) { self.set(m, self.nameField, input.get("name")); }
+            self.set(m, self.emailField, Str.lower(str(input.get("email"))));
+            self.set(m, self.passwordField, passwordHash);
+            m.save();
+            return m;
+        }
+        fn findByEmail(email: string) -> any {
+            return new Query<Model>(TableMap.of(self.info)).firstWhere(self.emailField, Str.lower(Str.trim(email)));
+        }
+        fn findById(id: string) -> any {
+            let map = TableMap.of(self.info);
+            return new Query<Model>(map).firstWhere(map.id.column, id);
+        }
+        fn email(user: any) -> string { return str(self.info.field(self.emailField).get(user)); }
+        fn passwordHash(user: any) -> string { return str(self.info.field(self.passwordField).get(user)); }
+        fn setPasswordHash(user: any, hash: string) { self.set(user, self.passwordField, hash); (user as Model).save(); }
+        fn emailVerified(user: any) -> bool {
+            let f = self.info.field(self.verifiedField);
+            return f != null && f.get(user) != null;
+        }
+        fn markEmailVerified(user: any) {
+            if (self.info.field(self.verifiedField) == null) { return; }
+            self.set(user, self.verifiedField, DateTime.now());
+            (user as Model).save();
+        }
+        fn twoFactor(user: any) -> TwoFactorState {
+            let f = self.info.field(self.twoFactorField);
+            if (f == null) { throw new StateError("two-factor sign-in needs a '" + self.twoFactorField + "' field on " + self.info.name); }
+            let v = f.get(user);
+            return v == null ? new TwoFactorState() : TwoFactorState.fromJson(str(v));
+        }
+        fn saveTwoFactor(user: any, state: TwoFactorState) {
+            self.set(user, self.twoFactorField, state.secret == "" ? "" : state.toJson());
+            (user as Model).save();
+        }
+        private fn set(obj: any, field: string, value: any) {
+            let f = self.info.field(field);
+            if (f == null) { throw new StateError(self.info.name + " has no field '" + field + "'"); }
+            f.set(obj, value);
+        }
+    }
+}
