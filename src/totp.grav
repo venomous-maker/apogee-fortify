@@ -1,0 +1,108 @@
+// totp.grav — two-factor codes: Base32 secrets, time-based one-time passwords
+// (RFC 6238, as authenticator apps make them) and single-use recovery codes.
+import "std"
+import "std/net"
+
+namespace apogee {
+
+    // RFC 4648 Base32 (the alphabet authenticator apps use for secrets).
+    class Base32 {
+        static fn encode(b: Bytes) -> string {
+            let alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+            let out = new StringBuilder();
+            let buffer = 0;
+            let bits = 0;
+            for (i in 0..b.size()) {
+                buffer = (buffer << 8) | b.get(i);
+                bits += 8;
+                while (bits >= 5) {
+                    out.appendChar(alphabet[(buffer >> (bits - 5)) & 31] as int);
+                    bits -= 5;
+                }
+            }
+            if (bits > 0) { out.appendChar(alphabet[(buffer << (5 - bits)) & 31] as int); }
+            return out.toString();
+        }
+        // The bytes of Base32 text (case, spaces, dashes and padding ignored); ValueError otherwise.
+        static fn decode(text: string) -> Bytes {
+            let out = new Bytes();
+            let buffer = 0;
+            let bits = 0;
+            for (c in Str.upper(text) as binary) {
+                if (c == 32 || c == 45 || c == 61) { continue; }
+                let v = c >= 65 && c <= 90 ? c - 65 : (c >= 50 && c <= 55 ? c - 24 : -1);
+                if (v < 0) { throw new ValueError("not Base32"); }
+                buffer = ((buffer << 5) | v) & 0xffff;
+                bits += 5;
+                if (bits >= 8) { out.appendByte((buffer >> (bits - 8)) & 255); bits -= 8; }
+            }
+            return out;
+        }
+    }
+
+    // Time-based one-time passwords (RFC 6238 over HMAC-SHA1, 30-second steps,
+    // 6 digits: what Google Authenticator, 1Password, Authy and the rest show).
+    class Totp {
+        static digits: int = 6
+        static period: long = 30
+
+        // A new random secret (160 bits), as Base32.
+        static fn generateSecret() -> string { return Base32.encode(Crypto.randomBytes(20)); }
+        // The code for `secret` in the time step `step` (Time.now() / period).
+        static fn codeAt(secret: string, step: long) -> string {
+            let counter = new Bytes();
+            for (k in 7..=0 step -1) { counter.appendByte(((step >> (k * 8)) & 255) as int); }
+            let h = Crypto.hmac("sha1", Base32.decode(secret), counter);
+            let off = h.get(h.size() - 1) & 15;
+            let bin = ((h.get(off) & 127) << 24) | (h.get(off + 1) << 16) | (h.get(off + 2) << 8) | h.get(off + 3);
+            let mod = 1;
+            for (k in 0..Totp.digits) { mod *= 10; }
+            return Str.padLeft(str(bin % mod), Totp.digits, "0");
+        }
+        // The code right now.
+        static fn now(secret: string) -> string { return Totp.codeAt(secret, Time.now() / Totp.period); }
+        // The time step `code` belongs to, within `window` steps either side of
+        // now (a clock a little off still works), and after `lastStep` (so a
+        // code is good once); -1 when it fits none. Compared in constant time.
+        static fn verify(secret: string, code: string, lastStep: long = -1, window: int = 1) -> long {
+            let c = Str.replace(Str.trim(code), " ", "");
+            if (c.length != Totp.digits || !Str.isDigits(c)) { return -1; }
+            let now = Time.now() / Totp.period;
+            let found: long = -1;
+            for (d in -window..=window) {
+                let step = now + d;
+                if (step <= lastStep) { continue; }
+                if (Hash.equals(Totp.codeAt(secret, step), c) && found < 0) { found = step; }
+            }
+            return found;
+        }
+        // The otpauth:// address an authenticator app reads (from a QR code).
+        static fn uri(issuer: string, account: string, secret: string) -> string {
+            let label = Url.encode(issuer) + ":" + Url.encode(account);
+            return "otpauth://totp/" + label + "?secret=" + secret + "&issuer=" + Url.encode(issuer) +
+                   "&algorithm=SHA1&digits=" + str(Totp.digits) + "&period=" + str(Totp.period);
+        }
+    }
+
+    // Single-use recovery codes ("a1b2c-d3e4f"), kept as SHA-256 hashes.
+    class RecoveryCodes {
+        // `n` new codes: the text to show the user once.
+        static fn generate(n: int = 8) -> Array<string> {
+            let out = new Array<string>();
+            for (i in 0..n) {
+                let t = Hash.randomToken(5);
+                out.push(t[..5] + "-" + t[5..]);
+            }
+            return out;
+        }
+        static fn hash(code: string) -> string { return Hash.sha256(Str.lower(Str.trim(code))); }
+        // The hashes with `code` used up (removed), or null when it is not one of them.
+        static fn use(hashes: Array<string>, code: string) -> Array<string> {
+            let h = RecoveryCodes.hash(code);
+            let out = new Array<string>();
+            let hit = false;
+            for (x in hashes) { if (!hit && Hash.equals(x, h)) { hit = true; } else { out.push(x); } }
+            return hit ? out : null;
+        }
+    }
+}
