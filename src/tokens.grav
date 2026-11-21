@@ -1,0 +1,93 @@
+// tokens.grav — password reset tokens: random, stored only as a hash, good
+// for `expireMinutes`, one per address, and not reissued within
+// `throttleSeconds` (so the form cannot be used to flood someone's inbox).
+import "std"
+import "grav-db"
+use db.*
+
+namespace apogee {
+
+    interface ResetTokenStore {
+        // Saves a token hash for `email` (replacing any older one).
+        fn put(email: string, tokenHash: string, createdAt: long)
+        // The hash and creation time for `email`, or null.
+        fn find(email: string) -> ResetTokenRecord
+        fn delete(email: string)
+    }
+
+    class ResetTokenRecord {
+        public tokenHash: string
+        public createdAt: long
+        constructor(tokenHash: string, createdAt: long) { self.tokenHash = tokenHash; self.createdAt = createdAt; }
+    }
+
+    // In this process's memory (development, tests). Thread-safe.
+    class MemoryResetTokenStore implements ResetTokenStore {
+        private rows: HashMap<string, ResetTokenRecord> = new HashMap<string, ResetTokenRecord>()
+        private lock: Mutex = new Mutex()
+        constructor() {}
+        fn put(email: string, tokenHash: string, createdAt: long) { self.lock.lock(); self.rows.put(email, new ResetTokenRecord(tokenHash, createdAt)); self.lock.unlock(); }
+        fn find(email: string) -> ResetTokenRecord { self.lock.lock(); let r = self.rows.getOr(email, null); self.lock.unlock(); return r; }
+        fn delete(email: string) { self.lock.lock(); self.rows.remove(email); self.lock.unlock(); }
+    }
+
+    // In a table `password_reset_tokens` (email, token_hash, created_at).
+    class DatabaseResetTokenStore implements ResetTokenStore {
+        public table: string
+        private pool: Pool
+        constructor(pool: Pool, table: string = "password_reset_tokens") { self.pool = pool; self.table = table; }
+        private fn with(f: fn(Connection)) {
+            let c = self.pool.acquire();
+            try { f(c); } finally { self.pool.release(c); }
+        }
+        fn createTable() {
+            self.with(fn(c: Connection) {
+                c.exec("CREATE TABLE IF NOT EXISTS " + self.table + " (email VARCHAR(190) NOT NULL PRIMARY KEY, token_hash VARCHAR(64) NOT NULL, created_at BIGINT NOT NULL)");
+            });
+        }
+        fn put(email: string, tokenHash: string, createdAt: long) {
+            self.with(fn(c: Connection) {
+                c.transaction(fn() {
+                    c.execute("DELETE FROM " + self.table + " WHERE email = ?", [email]);
+                    c.execute("INSERT INTO " + self.table + " (email, token_hash, created_at) VALUES (?, ?, ?)", [email, tokenHash, createdAt]);
+                });
+            });
+        }
+        fn find(email: string) -> ResetTokenRecord {
+            let out: ResetTokenRecord = null;
+            self.with(fn(c: Connection) {
+                for (r in c.query("SELECT token_hash, created_at FROM " + self.table + " WHERE email = ?", [email])) {
+                    out = new ResetTokenRecord(r.getString("token_hash"), Integer.parseOr(str(r.get("created_at")), 0));
+                }
+            });
+            return out;
+        }
+        fn delete(email: string) { self.with(fn(c: Connection) { c.execute("DELETE FROM " + self.table + " WHERE email = ?", [email]); }); }
+    }
+
+    // Issues and checks reset tokens.
+    class PasswordBroker {
+        public store: ResetTokenStore
+        public expireMinutes: long = 60
+        public throttleSeconds: long = 60
+        constructor(store: ResetTokenStore) { self.store = store; }
+        // A new token for `email`; "" when one was issued less than throttleSeconds ago.
+        fn createToken(email: string) -> string {
+            let key = Str.lower(Str.trim(email));
+            let now = Time.now();
+            let old = self.store.find(key);
+            if (old != null && now - old.createdAt < self.throttleSeconds) { return ""; }
+            let token = Hash.randomToken(32);
+            self.store.put(key, Hash.sha256(token), now);
+            return token;
+        }
+        // Whether `token` is the current, unexpired one for `email`.
+        fn valid(email: string, token: string) -> bool {
+            let r = self.store.find(Str.lower(Str.trim(email)));
+            if (r == null || Time.now() - r.createdAt > self.expireMinutes * 60) { return false; }
+            return Hash.equals(r.tokenHash, Hash.sha256(token));
+        }
+        // Uses the token up.
+        fn forget(email: string) { self.store.delete(Str.lower(Str.trim(email))); }
+    }
+}
