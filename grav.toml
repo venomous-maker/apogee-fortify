@@ -1,0 +1,17 @@
+name = "apogee-fortify"
+lib = "src/all.grav"
+grav = ">=1.11.0"
+paths = ["src"]
+
+[dependencies]
+apogee-container = "github.com/venomous-maker/apogee-container@v0.2.0"
+apogee-http = "github.com/venomous-maker/apogee-http@v0.2.0"
+apogee-routing = "github.com/venomous-maker/apogee-routing@v0.2.0"
+apogee-session = "github.com/venomous-maker/apogee-session@v0.2.1"
+apogee-validation = "github.com/venomous-maker/apogee-validation@v0.2.0"
+apogee-auth = "github.com/venomous-maker/apogee-auth@v0.2.1"
+apogee-crypt = "github.com/venomous-maker/apogee-crypt@v0.1.0"
+grav-orbit = "github.com/venomous-maker/grav-orbit@v0.2.0"
+grav-db = "github.com/venomous-maker/grav-db@v0.2.0"
+# (the tests drive the flows through the router)
+apogee-testing = "github.com/venomous-maker/apogee-testing@v0.1.0"
