@@ -1,0 +1,342 @@
+// fortify.grav — the sign-in flows every app needs, as routes with no views
+// (the app draws its own pages; JSON clients get JSON): registration, login
+// with an optional two-factor challenge, logout, password reset by email,
+// email verification by signed link, changing the password, confirming it
+// before sensitive actions, and two-factor setup with recovery codes.
+//
+//   Fortify.users = new ModelUsers(reflect(User))
+//   Fortify.auth = auth                                 // the app's AuthManager
+//   Fortify.sendResetLink = fn(user: any, url: string) { mail.to(...).send(new ResetMail(url)) }
+//   Fortify.sendVerificationLink = fn(user: any, url: string) { ... }
+//   Fortify.routes(router)
+//   router.get("/billing", ...).middleware(["auth", "verified", "password.confirm"])
+import "std"
+import "apogee-http"
+import "apogee-routing"
+import "apogee-session"
+import "apogee-validation"
+import "apogee-auth"
+import "apogee-crypt"
+import "users.grav"
+import "tokens.grav"
+import "totp.grav"
+
+namespace apogee {
+
+    class Fortify {
+        static users: FortifyUsers = null
+        static auth: AuthManager = null
+        static broker: PasswordBroker = new PasswordBroker(new MemoryResetTokenStore())
+        static limiter: RateLimiter = new RateLimiter()
+        // Which flows are on.
+        static registration: bool = true
+        static resetPasswords: bool = true
+        static emailVerification: bool = true
+        static updatePasswords: bool = true
+        static twoFactor: bool = true
+        // Where a browser goes after signing in (or registering), and after logging out.
+        static home: string = "/home"
+        static afterLogout: string = "/"
+        // The rules a new password must pass.
+        static passwordRules: string = "required|string|min:8|confirmed"
+        // Sign-in attempts per minute for one email and address.
+        static loginsPerMinute: int = 5
+        // How long a password confirmation lasts (seconds).
+        static passwordTimeout: long = 10800
+        // Shown in authenticator apps.
+        static issuer: string = "Apogee"
+        // The link in the reset email (the app's reset page), and how to send it.
+        static resetUrl: fn(string, string) -> string = fn(token: string, email: string) -> string { return "/reset-password/" + token + "?email=" + Url.encode(email); }
+        static sendResetLink: fn(any, string) = null
+        static sendVerificationLink: fn(any, string) = null
+        // Seconds a verification link stays good.
+        static verificationLinkSeconds: long = 3600
+        private static router: Router = null
+
+        // Registers the routes (and the `verified` and `password.confirm` middleware).
+        static fn routes(r: Router) {
+            Fortify.router = r;
+            r.aliasInstance("verified", new EnsureEmailIsVerified());
+            r.aliasInstance("password.confirm", new RequirePasswordConfirmation());
+            r.middleware(["guest"]).group(fn(g: Router) {
+                if (Fortify.registration) { g.post("/register", fn(req: Request) -> Response { return Fortify.register(req); }).name("register"); }
+                g.post("/login", fn(req: Request) -> Response { return Fortify.login(req); }).name("login.store");
+                if (Fortify.twoFactor) { g.post("/two-factor-challenge", fn(req: Request) -> Response { return Fortify.challenge(req); }).name("two-factor.login"); }
+                if (Fortify.resetPasswords) {
+                    g.post("/forgot-password", fn(req: Request) -> Response { return Fortify.forgot(req); }).name("password.email");
+                    g.post("/reset-password", fn(req: Request) -> Response { return Fortify.reset(req); }).name("password.update");
+                }
+            });
+            r.post("/logout", fn(req: Request) -> Response { return Fortify.logout(req); }).name("logout");
+            if (Fortify.emailVerification) {
+                r.get("/email/verify/{id}/{hash}", fn(req: Request) -> Response { return Fortify.verify(req); }).name("verification.verify");
+                r.middleware(["auth"]).group(fn(g: Router) {
+                    g.post("/email/verification-notification", fn(req: Request) -> Response { return Fortify.resendVerification(req); }).name("verification.send");
+                });
+            }
+            r.middleware(["auth"]).group(fn(g: Router) {
+                g.post("/user/confirm-password", fn(req: Request) -> Response { return Fortify.confirmPassword(req); }).name("password.confirm.store");
+                g.get("/user/confirmed-password-status", fn(req: Request) -> Response {
+                    return Response.json({"confirmed": Fortify.recentlyConfirmed(req)});
+                }).name("password.confirmation");
+                if (Fortify.updatePasswords) { g.put("/user/password", fn(req: Request) -> Response { return Fortify.updatePassword(req); }).name("user-password.update"); }
+                if (Fortify.twoFactor) {
+                    g.middleware(["password.confirm"]).group(fn(t: Router) {
+                        t.post("/user/two-factor-authentication", fn(req: Request) -> Response { return Fortify.enableTwoFactor(req); }).name("two-factor.enable");
+                        t.delete("/user/two-factor-authentication", fn(req: Request) -> Response { return Fortify.disableTwoFactor(req); }).name("two-factor.disable");
+                        t.post("/user/two-factor-recovery-codes", fn(req: Request) -> Response { return Fortify.regenerateCodes(req); }).name("two-factor.regenerate-recovery-codes");
+                    });
+                    g.post("/user/confirmed-two-factor-authentication", fn(req: Request) -> Response { return Fortify.confirmTwoFactor(req); }).name("two-factor.confirm");
+                }
+            });
+        }
+
+        // ── helpers ─────────────────────────────────────────────────────────
+        private static fn session(req: Request) -> Session {
+            if (!(req.session is Session)) { throw new StateError("Fortify's routes need the session middleware"); }
+            return req.session as Session;
+        }
+        private static fn users() -> FortifyUsers {
+            if (Fortify.users == null || Fortify.auth == null) { throw new StateError("set Fortify.users and Fortify.auth first"); }
+            return Fortify.users;
+        }
+        private static fn done(req: Request, json: HashMap<string, any>, redirect: string, status: string = "", code: int = 200) -> Response {
+            if (req.expectsJson()) { return Response.json(json, code); }
+            if (status != "") { Fortify.session(req).flash("status", status); }
+            return AuthManager.attachCookies(req, Response.redirect(redirect));
+        }
+        private static fn fail(field: string, message: string) -> ValidationException {
+            let m = new HashMap<string, Array<string>>();
+            let a = new Array<string>();
+            a.push(message);
+            m.put(field, a);
+            return ValidationException.withMessages(m);
+        }
+        static fn recentlyConfirmed(req: Request) -> bool {
+            let at = Fortify.session(req).get("auth.password_confirmed_at", null);
+            return at != null && Time.now() - Integer.parseOr(str(at), 0) < Fortify.passwordTimeout;
+        }
+        private static fn secretOf(state: TwoFactorState) -> string { return state.secret == "" ? "" : Crypt.decryptString(state.secret); }
+
+        // ── registration, login, logout ─────────────────────────────────────
+        static fn register(req: Request) -> Response {
+            let us = Fortify.users();
+            req.validate({"name": "required|string|max:255", "email": "required|email|max:255", "password": Fortify.passwordRules});
+            if (us.findByEmail(req.string("email")) != null) { throw Fortify.fail("email", "The email has already been taken."); }
+            let input = new HashMap<string, any>();
+            input.put("name", req.string("name"));
+            input.put("email", Str.lower(req.string("email")));
+            let user = us.create(input, Passwords.make(req.string("password")));
+            Fortify.auth.session().login(req, user);
+            Fortify.session(req).regenerate();
+            if (Fortify.emailVerification) { Fortify.sendVerification(user); }
+            return Fortify.done(req, {"registered": true}, Fortify.home, "", 201);
+        }
+        static fn login(req: Request) -> Response {
+            let us = Fortify.users();
+            req.validate({"email": "required|string", "password": "required|string"});
+            let email = Str.lower(req.string("email"));
+            let key = "login|" + email + "|" + req.ip();
+            if (Fortify.limiter.attempt(key, Fortify.loginsPerMinute, 60) < 0) {
+                throw Fortify.fail("email", "Too many sign-in attempts. Try again in " + str(Fortify.limiter.availableIn(key, 60)) + " seconds.");
+            }
+            let user = us.findByEmail(email);
+            if (user == null || !Passwords.check(req.string("password"), us.passwordHash(user))) {
+                throw Fortify.fail("email", "These credentials do not match our records.");
+            }
+            if (Passwords.needsRehash(us.passwordHash(user))) { us.setPasswordHash(user, Passwords.make(req.string("password"))); }
+            if (Fortify.twoFactor && us.twoFactor(user).enabled()) {
+                // the password was right: the code comes next (nothing is signed in yet)
+                let s = Fortify.session(req);
+                s.put("login.id", (user as Authenticatable).authId());
+                s.put("login.remember", req.boolean("remember"));
+                return Fortify.done(req, {"two_factor": true}, "/two-factor-challenge");
+            }
+            Fortify.auth.session().login(req, user, req.boolean("remember"));
+            Fortify.session(req).regenerate();
+            return Fortify.done(req, {"two_factor": false}, Fortify.home);
+        }
+        // The code (or a recovery code) after a password that was right.
+        static fn challenge(req: Request) -> Response {
+            let us = Fortify.users();
+            let s = Fortify.session(req);
+            let id = str(s.get("login.id", ""));
+            let user = id == "" ? null : us.findById(id);
+            if (user == null) { throw Fortify.fail("code", "Sign in again."); }
+            let key = "two-factor|" + id;
+            if (Fortify.limiter.attempt(key, Fortify.loginsPerMinute, 60) < 0) { throw Fortify.fail("code", "Too many attempts. Try again in a minute."); }
+            let state = us.twoFactor(user);
+            if (req.filled("recovery_code")) {
+                let left = RecoveryCodes.use(state.recoveryHashes, req.string("recovery_code"));
+                if (left == null) { throw Fortify.fail("recovery_code", "The recovery code was invalid."); }
+                state.recoveryHashes = left;
+                us.saveTwoFactor(user, state);
+            } else {
+                let step = Totp.verify(Fortify.secretOf(state), req.string("code"), state.lastStep);
+                if (step < 0) { throw Fortify.fail("code", "The two-factor code was invalid."); }
+                state.lastStep = step;
+                us.saveTwoFactor(user, state);
+            }
+            let remember = s.get("login.remember", false) == true as any;
+            s.forget("login.id");
+            s.forget("login.remember");
+            Fortify.auth.session().login(req, user, remember);
+            s.regenerate();
+            return Fortify.done(req, {"two_factor": false}, Fortify.home);
+        }
+        static fn logout(req: Request) -> Response {
+            Fortify.users();
+            Fortify.auth.session().logout(req);
+            Fortify.session(req).invalidate();
+            return Fortify.done(req, {"logged_out": true}, Fortify.afterLogout);
+        }
+
+        // ── password reset ──────────────────────────────────────────────────
+        static fn forgot(req: Request) -> Response {
+            let us = Fortify.users();
+            req.validate({"email": "required|email"});
+            let email = Str.lower(req.string("email"));
+            let user = us.findByEmail(email);
+            // (the same answer whether or not the address has an account)
+            if (user != null) {
+                let token = Fortify.broker.createToken(email);
+                let send = Fortify.sendResetLink;
+                let link = Fortify.resetUrl;
+                if (token != "" && send != null) { send(user, link(token, email)); }
+            }
+            return Fortify.done(req, {"status": "sent"}, "/forgot-password", "We have emailed your password reset link.");
+        }
+        static fn reset(req: Request) -> Response {
+            let us = Fortify.users();
+            req.validate({"token": "required|string", "email": "required|email", "password": Fortify.passwordRules});
+            let email = Str.lower(req.string("email"));
+            let user = us.findByEmail(email);
+            if (user == null || !Fortify.broker.valid(email, req.string("token"))) {
+                throw Fortify.fail("email", "This password reset token is invalid.");
+            }
+            us.setPasswordHash(user, Passwords.make(req.string("password")));
+            Fortify.broker.forget(email);
+            return Fortify.done(req, {"status": "reset"}, "/login", "Your password has been reset.");
+        }
+
+        // ── email verification ──────────────────────────────────────────────
+        // A signed link that verifies `user`'s address (good for verificationLinkSeconds).
+        static fn verificationUrl(user: any) -> string {
+            let params = new HashMap<string, any>();
+            params.put("id", (user as Authenticatable).authId());
+            params.put("hash", Hash.sha256(Str.lower(Fortify.users.email(user))));
+            return Fortify.router.signedUrl("verification.verify", params, Time.now() + Fortify.verificationLinkSeconds);
+        }
+        static fn sendVerification(user: any) {
+            let send = Fortify.sendVerificationLink;
+            if (send != null && !Fortify.users.emailVerified(user)) { send(user, Fortify.verificationUrl(user)); }
+        }
+        static fn verify(req: Request) -> Response {
+            let us = Fortify.users();
+            if (!Fortify.router.hasValidSignature(req)) { throw new HttpException(403, "This verification link is invalid or has expired."); }
+            let user = us.findById(str(req.route("id")));
+            if (user == null || !Hash.equals(Hash.sha256(Str.lower(us.email(user))), str(req.route("hash")))) {
+                throw new HttpException(403, "This verification link is invalid.");
+            }
+            if (!us.emailVerified(user)) { us.markEmailVerified(user); }
+            return Fortify.done(req, {"verified": true}, Fortify.home + "?verified=1");
+        }
+        static fn resendVerification(req: Request) -> Response {
+            let us = Fortify.users();
+            if (us.emailVerified(req.user)) { return Fortify.done(req, {"verified": true}, Fortify.home); }
+            let key = "verify|" + (req.user as Authenticatable).authId();
+            if (Fortify.limiter.attempt(key, 6, 60) < 0) { throw Fortify.fail("email", "Too many requests. Try again in a minute."); }
+            Fortify.sendVerification(req.user);
+            return Fortify.done(req, {"status": "verification-link-sent"}, "/email/verify", "verification-link-sent", 202);
+        }
+
+        // ── the signed-in user's password ───────────────────────────────────
+        static fn confirmPassword(req: Request) -> Response {
+            let us = Fortify.users();
+            req.validate({"password": "required|string"});
+            if (!Passwords.check(req.string("password"), us.passwordHash(req.user))) {
+                throw Fortify.fail("password", "The provided password was incorrect.");
+            }
+            Fortify.session(req).put("auth.password_confirmed_at", Time.now());
+            let intended = str(Fortify.session(req).pull("url.intended", Fortify.home));
+            return Fortify.done(req, {"confirmed": true}, intended, "", 201);
+        }
+        static fn updatePassword(req: Request) -> Response {
+            let us = Fortify.users();
+            req.validate({"current_password": "required|string", "password": Fortify.passwordRules});
+            if (!Passwords.check(req.string("current_password"), us.passwordHash(req.user))) {
+                throw Fortify.fail("current_password", "The provided password does not match your current password.");
+            }
+            us.setPasswordHash(req.user, Passwords.make(req.string("password")));
+            return Fortify.done(req, {"status": "password-updated"}, "/user/profile", "password-updated");
+        }
+
+        // ── two-factor setup ────────────────────────────────────────────────
+        // A new secret and recovery codes (unconfirmed until a code from the app arrives).
+        static fn enableTwoFactor(req: Request) -> Response {
+            let us = Fortify.users();
+            let state = new TwoFactorState();
+            let secret = Totp.generateSecret();
+            state.secret = Crypt.encryptString(secret);
+            let codes = RecoveryCodes.generate();
+            for (c in codes) { state.recoveryHashes.push(RecoveryCodes.hash(c)); }
+            us.saveTwoFactor(req.user, state);
+            let a = new Array<any>();
+            for (c in codes) { a.push(c as any); }
+            return Fortify.done(req, {"secret": secret, "otpauth_url": Totp.uri(Fortify.issuer, us.email(req.user), secret), "recovery_codes": a as any},
+                                "/user/profile", "two-factor-authentication-enabled");
+        }
+        static fn confirmTwoFactor(req: Request) -> Response {
+            let us = Fortify.users();
+            let state = us.twoFactor(req.user);
+            if (state.secret == "") { throw Fortify.fail("code", "Two-factor sign-in is not being set up."); }
+            let step = Totp.verify(Fortify.secretOf(state), req.string("code"), state.lastStep);
+            if (step < 0) { throw Fortify.fail("code", "The provided two-factor code was invalid."); }
+            state.confirmedAt = Time.now();
+            state.lastStep = step;
+            us.saveTwoFactor(req.user, state);
+            return Fortify.done(req, {"confirmed": true}, "/user/profile", "two-factor-authentication-confirmed");
+        }
+        static fn disableTwoFactor(req: Request) -> Response {
+            Fortify.users().saveTwoFactor(req.user, new TwoFactorState());
+            return Fortify.done(req, {"disabled": true}, "/user/profile", "two-factor-authentication-disabled");
+        }
+        // New recovery codes (the old ones stop working); shown once.
+        static fn regenerateCodes(req: Request) -> Response {
+            let us = Fortify.users();
+            let state = us.twoFactor(req.user);
+            if (!state.enabled()) { throw Fortify.fail("code", "Two-factor sign-in is not on."); }
+            let codes = RecoveryCodes.generate();
+            state.recoveryHashes = new Array<string>();
+            for (c in codes) { state.recoveryHashes.push(RecoveryCodes.hash(c)); }
+            us.saveTwoFactor(req.user, state);
+            let a = new Array<any>();
+            for (c in codes) { a.push(c as any); }
+            return Fortify.done(req, {"recovery_codes": a as any}, "/user/profile", "recovery-codes-generated");
+        }
+    }
+
+    // `verified`: the signed-in user's email must be verified (403 for JSON, else to /email/verify).
+    class EnsureEmailIsVerified implements Middleware {
+        constructor() {}
+        fn handle(req: Request, next: fn(Request) -> Response) -> Response {
+            if (req.user != null && Fortify.users != null && !Fortify.users.emailVerified(req.user)) {
+                if (req.expectsJson()) { return Response.json({"message": "Your email address is not verified."}, 403); }
+                return Response.redirect("/email/verify");
+            }
+            return next(req);
+        }
+    }
+
+    // `password.confirm`: the password must have been confirmed within passwordTimeout
+    // (423 for JSON, else to /user/confirm-password, coming back afterwards).
+    class RequirePasswordConfirmation implements Middleware {
+        constructor() {}
+        fn handle(req: Request, next: fn(Request) -> Response) -> Response {
+            if (req.session is Session && Fortify.recentlyConfirmed(req)) { return next(req); }
+            if (req.expectsJson()) { return Response.json({"message": "Password confirmation required."}, 423); }
+            if (req.session is Session) { (req.session as Session).put("url.intended", req.fullUrl()); }
+            return Response.redirect("/user/confirm-password");
+        }
+    }
+}
