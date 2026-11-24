@@ -10,4 +10,8 @@ compiler versions it builds with.
   email, email verification by signed link, password confirmation and change,
   and two-factor setup with recovery codes (RFC 6238), as routes.
 - `ModelUsers` for an Orbit model; `FortifyUsers` for anything else.
-- Memory and database reset-token stores.
+- Reset tokens as an Orbit model with its migration; an Orbit store and a
+  memory one; a migration adding `email_verified_at` and `two_factor` to the
+  users table when missing.
+- `FortifyPackage`: connects itself to an apogee-framework app (settings, the
+  routes in the web group, the users from auth.model, the links by email).
