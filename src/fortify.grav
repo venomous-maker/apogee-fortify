@@ -129,7 +129,8 @@ namespace apogee {
             let user = us.create(input, Passwords.make(req.string("password")));
             Fortify.auth.session().login(req, user);
             Fortify.session(req).regenerate();
-            if (Fortify.emailVerification) { Fortify.sendVerification(user); }
+            // (the account exists now: a mail that fails is sent again from verification-notification)
+            if (Fortify.emailVerification) { try { Fortify.sendVerification(user); } catch (e: Exception) {} }
             return Fortify.done(req, {"registered": true}, Fortify.home, "", 201);
         }
         static fn login(req: Request) -> Response {
