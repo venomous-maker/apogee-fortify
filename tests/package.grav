@@ -1,0 +1,89 @@
+// FortifyPackage connects itself: the migrations add its table and the users
+// columns (only once), boot takes the users from auth.model, mounts the routes
+// in the web group, and sends the reset link by email; the reset works
+// through the Orbit token store.
+import "std"
+import "apogee-container"
+import "apogee-config"
+import "apogee-package"
+import "apogee-http"
+import "apogee-routing"
+import "apogee-session"
+import "apogee-auth"
+import "apogee-crypt"
+import "apogee-mail"
+import "apogee-testing"
+import "grav-orbit"
+import "../src/all.grav"
+use apogee.*
+use orbit.*
+
+class Account extends Model implements Authenticatable {
+    public id: long = 0
+    public name: string = ""
+    public email: string = ""
+    public password: string = ""
+    public emailVerifiedAt: DateTime? = null
+    public twoFactor: string = ""
+    constructor() {}
+    fn authId() -> string { return str(self.id) }
+    fn authPassword() -> string { return self.password }
+}
+class Users implements UserProvider {
+    constructor() {}
+    fn retrieveById(id: string) -> any { return Fortify.users.findById(id) }
+    fn retrieveByCredentials(c: HashMap<string, any>) -> any { return null }
+    fn validateCredentials(user: any, c: HashMap<string, any>) -> bool { return false }
+    fn retrieveByToken(id: string, token: string) -> any { return null }
+    fn updateRememberToken(user: any, token: string) {}
+}
+
+test "the package connects itself" {
+    let file = Dir.temp() + "/fortify_pkg_" + str(Process.pid()) + ".sqlite"
+    new File(file).delete()
+    DB.connect(Sqlite.open(file))
+    Schema.create("accounts", fn(t: Blueprint) { t.id(); t.varchar("name"); t.varchar("email"); t.varchar("password") })
+    Crypt.setKey("base64:" + Base64.encodeBytes(Crypto.randomBytes(32)))
+    Passwords.iterations = 1000
+    let ps = Packages.discover()
+    assertEq(ps.size(), 1)
+    let p = ps[0]
+    Config.set("fortify.users_table", "accounts")
+    Config.set("auth.model", reflect(Account).name)
+    Config.set("app.url", "https://shop.test")
+    Packages.applyDefaults(ps)
+    for (m in p.migrations()) { (m as Migration).up() }
+    new AddFortifyColumnsToUsers("accounts").up()                              // the columns only once
+    assert(Schema.hasColumn("accounts", "two_factor") && Schema.hasTable("password_reset_tokens"))
+    let c = new Container()
+    let auth = new AuthManager(new Gate())
+    auth.addGuard(new SessionGuard("web", new Users(), new CookieJar("k")))
+    c.instance::<AuthManager>(auth)
+    c.instance::<RateLimiter>(new RateLimiter())
+    let mail = new Mailer("array", new ArrayTransport(), c)
+    mail.alwaysFrom = new Address("hello@shop.test", "Shop")
+    c.instance::<Mailer>(mail)
+    let r = new Router(c)
+    r.signingKey = "k"
+    c.instance::<Router>(r)
+    r.aliasInstance("session", new StartSession(new SessionManager(new MemorySessionStore(), "k")))
+    r.aliasMiddleware("auth", fn(a: Array<string>) -> Middleware { return new Authenticate(auth, a) })
+    r.aliasInstance("guest", new RedirectIfAuthenticated(auth, "/home"))
+    r.middlewareGroup("web", ["session"])
+    Request.userResolver = fn(req: Request) -> any { return auth.guard().user(req) }
+    p.boot(new PackageContext(c, "testing", "k"))
+    let kernel = new HttpKernel(r)
+    kernel.debug = true
+    let client = new TestClient(kernel)
+    client.postJson("/register", {"name": "Ada", "email": "ada@shop.test", "password": "long enough", "password_confirmation": "long enough"}).assertStatus(201)
+    client.postJson("/logout", null).assertOk()
+    client.postJson("/forgot-password", {"email": "ada@shop.test"}).assertOk()
+    let sent = (mail.transport as ArrayTransport).messages()
+    assertEq(sent.size(), 2)                                                    // the verification link, then the reset link
+    assertEq(sent[1].subject, "Reset your Apogee password")
+    let body = sent[1].text
+    let token = Str.before(Str.after(body, "https://shop.test/reset-password/"), "?")
+    client.postJson("/reset-password", {"token": token, "email": "ada@shop.test", "password": "brand new one", "password_confirmation": "brand new one"}).assertOk()
+    client.postJson("/login", {"email": "ada@shop.test", "password": "brand new one"}).assertOk()
+    new File(file).delete()
+}
