@@ -1,9 +1,10 @@
-// tokens.grav — password reset tokens: random, stored only as a hash, good
+// tokens.grav — password reset tokens: random, stored only as a hash (an
+// Orbit model and its migration, or memory), good
 // for `expireMinutes`, one per address, and not reissued within
 // `throttleSeconds` (so the form cannot be used to flood someone's inbox).
 import "std"
-import "grav-db"
-use db.*
+import "grav-orbit"
+use orbit.*
 
 namespace apogee {
 
@@ -31,38 +32,58 @@ namespace apogee {
         fn delete(email: string) { self.lock.lock(); self.rows.remove(email); self.lock.unlock(); }
     }
 
-    // In a table `password_reset_tokens` (email, token_hash, created_at).
-    class DatabaseResetTokenStore implements ResetTokenStore {
-        public table: string
-        private pool: Pool
-        constructor(pool: Pool, table: string = "password_reset_tokens") { self.pool = pool; self.table = table; }
-        private fn with(f: fn(Connection)) {
-            let c = self.pool.acquire();
-            try { f(c); } finally { self.pool.release(c); }
-        }
-        fn createTable() {
-            self.with(fn(c: Connection) {
-                c.exec("CREATE TABLE IF NOT EXISTS " + self.table + " (email VARCHAR(190) NOT NULL PRIMARY KEY, token_hash VARCHAR(64) NOT NULL, created_at BIGINT NOT NULL)");
+    // A reset token's row (only its hash is stored).
+    class PasswordResetToken extends Model {
+        public id: long = 0
+        public email: string = ""
+        public tokenHash: string = ""
+        public issuedAt: long = 0
+        constructor() {}
+    }
+
+    class CreatePasswordResetTokensTable extends Migration {
+        constructor() {}
+        fn up() {
+            Schema.create("password_reset_tokens", fn(t: Blueprint) {
+                t.id(); t.varchar("email", 190).unique(); t.varchar("token_hash", 64); t.bigInteger("issued_at").defaultValue(0);
             });
         }
+        fn down() { Schema.dropIfExists("password_reset_tokens"); }
+    }
+
+    // The columns Fortify reads on the users table: email_verified_at and
+    // two_factor (each added only when missing).
+    class AddFortifyColumnsToUsers extends Migration {
+        public table: string
+        constructor(table: string = "users") { self.table = table; }
+        fn name() -> string { return "AddFortifyColumnsToUsers"; }
+        fn up() {
+            let t = self.table;
+            if (!Schema.hasColumn(t, "email_verified_at")) { Schema.table(t, fn(b: Blueprint) { b.dateTime("email_verified_at").nullable(); }); }
+            if (!Schema.hasColumn(t, "two_factor")) { Schema.table(t, fn(b: Blueprint) { b.text("two_factor").nullable(); }); }
+        }
+        fn down() {}
+    }
+
+    // In the app's database, through Orbit (see CreatePasswordResetTokensTable).
+    class OrbitResetTokenStore implements ResetTokenStore {
+        constructor() {}
+        private fn q() -> Query<PasswordResetToken> { return new Query<PasswordResetToken>(TableMap.of(reflect(PasswordResetToken))); }
         fn put(email: string, tokenHash: string, createdAt: long) {
-            self.with(fn(c: Connection) {
-                c.transaction(fn() {
-                    c.execute("DELETE FROM " + self.table + " WHERE email = ?", [email]);
-                    c.execute("INSERT INTO " + self.table + " (email, token_hash, created_at) VALUES (?, ?, ?)", [email, tokenHash, createdAt]);
-                });
+            DB.transaction(fn() {
+                self.q().where("email", email).delete();
+                let t = new PasswordResetToken();
+                t.email = email;
+                t.tokenHash = tokenHash;
+                t.issuedAt = createdAt;
+                t.save();
             });
         }
         fn find(email: string) -> ResetTokenRecord {
-            let out: ResetTokenRecord = null;
-            self.with(fn(c: Connection) {
-                for (r in c.query("SELECT token_hash, created_at FROM " + self.table + " WHERE email = ?", [email])) {
-                    out = new ResetTokenRecord(r.getString("token_hash"), Integer.parseOr(str(r.get("created_at")), 0));
-                }
-            });
-            return out;
+            let t = self.q().firstWhere("email", email);
+            return t == null ? null : new ResetTokenRecord(t.tokenHash, t.issuedAt);
         }
-        fn delete(email: string) { self.with(fn(c: Connection) { c.execute("DELETE FROM " + self.table + " WHERE email = ?", [email]); }); }
+        fn delete(email: string) { self.q().where("email", email).delete(); }
     }
 
     // Issues and checks reset tokens.
