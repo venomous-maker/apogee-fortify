@@ -1,5 +1,6 @@
-// all.grav — apogee-fortify: registration, login, two-factor, password reset, email verification.
+// all.grav — apogee-fortify: registration, login, two-factor, password reset, email verification, and its package.
 import "totp.grav"
 import "users.grav"
 import "tokens.grav"
 import "fortify.grav"
+import "package.grav"

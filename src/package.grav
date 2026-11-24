@@ -1,0 +1,91 @@
+// package.grav — how Fortify connects itself to an app (apogee-package): its
+// settings, the reset-token and users-column migrations, the routes (in the
+// app's `web` group), the users (the app's auth.model), the rate limiter, and
+// the reset and verification links sent by email.
+import "std"
+import "apogee-config"
+import "apogee-package"
+import "apogee-routing"
+import "apogee-auth"
+import "apogee-mail"
+import "users.grav"
+import "tokens.grav"
+import "fortify.grav"
+
+namespace apogee {
+
+    class FortifyPackage extends ApogeePackage {
+        constructor() {}
+        fn name() -> string { return "fortify"; }
+        fn after() -> Array<string> { return ["sanctum", "permission"]; }
+        fn defaults() -> HashMap<string, any> {
+            return {"fortify.home": Env.get("FORTIFY_HOME", "/home"),
+                    "fortify.registration": Env.getBool("FORTIFY_REGISTRATION", true),
+                    "fortify.reset_passwords": true, "fortify.email_verification": true,
+                    "fortify.update_passwords": true, "fortify.two_factor": true,
+                    "fortify.users_table": "users",
+                    "fortify.issuer": Env.get("APP_NAME", "Apogee"),
+                    "fortify.logins_per_minute": 5,
+                    "fortify.reset_url": "/reset-password/{token}?email={email}"};
+        }
+        fn migrations() -> Array<any> {
+            return [new CreatePasswordResetTokensTable() as any, new AddFortifyColumnsToUsers(Config.getString("fortify.users_table", "users")) as any];
+        }
+        fn boot(app: PackageContext) {
+            Fortify.home = Config.getString("fortify.home", "/home");
+            Fortify.registration = Config.getBool("fortify.registration", true);
+            Fortify.resetPasswords = Config.getBool("fortify.reset_passwords", true);
+            Fortify.emailVerification = Config.getBool("fortify.email_verification", true);
+            Fortify.updatePasswords = Config.getBool("fortify.update_passwords", true);
+            Fortify.twoFactor = Config.getBool("fortify.two_factor", true);
+            Fortify.issuer = Config.getString("fortify.issuer", "Apogee");
+            Fortify.loginsPerMinute = Config.getInt("fortify.logins_per_minute", 5) as int;
+            let pattern = Config.getString("fortify.reset_url", "/reset-password/{token}?email={email}");
+            let base = Config.getString("app.url", "");
+            Fortify.resetUrl = fn(token: string, email: string) -> string {
+                return base + Str.replace(Str.replace(pattern, "{token}", token), "{email}", Url.encode(email));
+            };
+            Fortify.broker = new PasswordBroker(new OrbitResetTokenStore());
+            Fortify.auth = app.make::<AuthManager>();
+            Fortify.limiter = app.make::<RateLimiter>();
+            let model = Config.getString("auth.model", "");
+            if (model != "" && Fortify.users == null) {
+                let cls = ClassInfo.forName(model);
+                if (cls != null) { Fortify.users = new ModelUsers(cls); }
+            }
+            // (the links by email, unless the app sends them its own way)
+            let mailer = app.make::<Mailer>();
+            let appName = Fortify.issuer;
+            if (Fortify.sendResetLink == null) {
+                Fortify.sendResetLink = fn(user: any, url: string) { mailer.to(Fortify.users.email(user)).send(new ResetPasswordMail(appName, url)); };
+            }
+            if (Fortify.sendVerificationLink == null) {
+                Fortify.sendVerificationLink = fn(user: any, url: string) { mailer.to(Fortify.users.email(user)).send(new VerifyEmailMail(appName, base + url)); };
+            }
+            app.make::<Router>().middleware(["web"]).group(fn(g: Router) { Fortify.routes(g); });
+        }
+    }
+
+    class ResetPasswordMail extends Mailable {
+        public app: string = ""
+        public url: string = ""
+        constructor(app: string = "", url: string = "") { self.app = app; self.url = url; }
+        fn build() {
+            self.subject("Reset your " + self.app + " password").markdown(
+                "# Reset your password\n\nSomeone asked to reset the password for your account. " +
+                "If it was you, follow the link below; it works for an hour.\n\n[Reset the password](" + self.url + ")\n\n" +
+                "If it was not you, there is nothing to do: your password stays as it is.");
+        }
+    }
+
+    class VerifyEmailMail extends Mailable {
+        public app: string = ""
+        public url: string = ""
+        constructor(app: string = "", url: string = "") { self.app = app; self.url = url; }
+        fn build() {
+            self.subject("Confirm your email address").markdown(
+                "# Confirm your email address\n\nFollow the link below to confirm the address for your " + self.app +
+                " account.\n\n[Confirm the address](" + self.url + ")");
+        }
+    }
+}
