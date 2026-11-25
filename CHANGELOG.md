@@ -6,6 +6,8 @@ compiler versions it builds with.
 
 ## Unreleased
 
+## 0.1.0 (2026-11-25)
+
 - Registration, login with a two-factor challenge, logout, password reset by
   email, email verification by signed link, password confirmation and change,
   and two-factor setup with recovery codes (RFC 6238), as routes.
