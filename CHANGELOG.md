@@ -17,3 +17,7 @@ compiler versions it builds with.
   users table when missing.
 - `FortifyPackage`: connects itself to an apogee-framework app (settings, the
   routes in the web group, the users from auth.model, the links by email).
+
+### Dependencies
+
+- Uses apogee-http 0.3.0, apogee-routing 0.3.0, apogee-session 0.2.2, apogee-validation 0.2.1, apogee-auth 0.2.2, apogee-crypt 0.2.0, apogee-mail 0.3.0, apogee-package 0.1.0, grav-orbit 0.3.0, apogee-testing 0.1.1 (from their GitHub tags).
