@@ -135,12 +135,12 @@ test "two-factor setup and sign-in with codes" {
     let stored = (Fortify.users.findByEmail("di@example.test") as User).twoFactor
     assert(!Str.contains(stored, secret) && !Str.contains(stored, codes.at(0).asString()))   // encrypted, and hashed
     c.postJson("/user/confirmed-two-factor-authentication", {"code": "000000"}).assertUnprocessable()
-    c.postJson("/user/confirmed-two-factor-authentication", {"code": Totp.now(secret)}).assertOk()
+    c.postJson("/user/confirmed-two-factor-authentication", {"code": new Totp(secret).now()}).assertOk()
     c.postJson("/logout", null)
     // the password alone is not enough now
     c.postJson("/login", {"email": "di@example.test", "password": "pass words"}).assertOk().assertJsonPath("two_factor", true)
     c.getJson("/me").assertJsonPath("email", "")
-    c.postJson("/two-factor-challenge", {"code": Totp.now(secret)}).assertUnprocessable()   // used at confirmation: good once
+    c.postJson("/two-factor-challenge", {"code": new Totp(secret).now()}).assertUnprocessable()   // used at confirmation: good once
     c.postJson("/two-factor-challenge", {"recovery_code": codes.at(0).asString()}).assertOk()
     c.getJson("/me").assertJsonPath("email", "di@example.test")
     c.postJson("/logout", null)

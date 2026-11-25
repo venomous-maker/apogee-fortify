@@ -173,7 +173,7 @@ namespace apogee {
                 state.recoveryHashes = left;
                 us.saveTwoFactor(user, state);
             } else {
-                let step = Totp.verify(Fortify.secretOf(state), req.string("code"), state.lastStep);
+                let step = new Totp(Fortify.secretOf(state)).verify(req.string("code"), state.lastStep);
                 if (step < 0) { throw Fortify.fail("code", "The two-factor code was invalid."); }
                 state.lastStep = step;
                 us.saveTwoFactor(user, state);
@@ -284,14 +284,14 @@ namespace apogee {
             us.saveTwoFactor(req.user, state);
             let a = new Array<any>();
             for (c in codes) { a.push(c as any); }
-            return Fortify.done(req, {"secret": secret, "otpauth_url": Totp.uri(Fortify.issuer, us.email(req.user), secret), "recovery_codes": a as any},
+            return Fortify.done(req, {"secret": secret, "otpauth_url": new Totp(secret).uri(Fortify.issuer, us.email(req.user)), "recovery_codes": a as any},
                                 "/user/profile", "two-factor-authentication-enabled");
         }
         static fn confirmTwoFactor(req: Request) -> Response {
             let us = Fortify.users();
             let state = us.twoFactor(req.user);
             if (state.secret == "") { throw Fortify.fail("code", "Two-factor sign-in is not being set up."); }
-            let step = Totp.verify(Fortify.secretOf(state), req.string("code"), state.lastStep);
+            let step = new Totp(Fortify.secretOf(state)).verify(req.string("code"), state.lastStep);
             if (step < 0) { throw Fortify.fail("code", "The provided two-factor code was invalid."); }
             state.confirmedAt = Time.now();
             state.lastStep = step;
