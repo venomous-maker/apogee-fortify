@@ -14,7 +14,7 @@ app's mailer, and adds two migrations (run them with `migrate`):
 `password_reset_tokens`, and the `email_verified_at` and `two_factor` columns on
 the users table (added only when missing).
 
-```grav
+```typescript
 import "std"
 import "apogee-fortify"
 use apogee.*
