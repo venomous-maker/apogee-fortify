@@ -45,9 +45,10 @@ test "the package connects itself" {
     Schema.create("accounts", fn(t: Blueprint) { t.id(); t.varchar("name"); t.varchar("email"); t.varchar("password") })
     Crypt.setKey("base64:" + Base64.encodeBytes(Crypto.randomBytes(32)))
     Passwords.iterations = 1000
-    let ps = Packages.discover()
-    assertEq(ps.size(), 1)
-    let p = ps[0]
+    let ps = Packages.discover()                                               // (CryptPackage comes too)
+    let p: ApogeePackage = null
+    for (x in ps) { if (x.name() == "fortify") { p = x } }
+    assert(p != null)
     Config.set("fortify.users_table", "accounts")
     Config.set("auth.model", reflect(Account).name)
     Config.set("app.url", "https://shop.test")
