@@ -56,7 +56,8 @@ with errors). Middleware: `verified` (email verified) and `password.confirm`.
 - Sign-in, two-factor and resend attempts are rate-limited (`loginsPerMinute`).
 - Reset tokens are random, kept only as SHA-256 hashes, expire after an hour,
   are used once, and are not reissued within a minute.
-- Two-factor codes are RFC 6238 (any authenticator app); a code is good once,
+- Two-factor codes are RFC 6238 (any authenticator app), made and checked by
+  std's `Totp` (grav 1.13); a code is good once,
   the secret is stored encrypted (apogee-crypt) and recovery codes only as hashes.
 - The session is regenerated at sign-in and invalidated at logout.
 
