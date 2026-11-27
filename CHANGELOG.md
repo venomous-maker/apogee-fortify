@@ -6,6 +6,10 @@ compiler versions it builds with.
 
 ## Unreleased
 
+### Fixes
+
+- Database connections that the server dropped while idle (MySQL's `wait_timeout`, a restart, a proxy's idle limit) reconnect on their next use instead of failing with "server has gone away" (grav-db 0.2.1). Uses the new releases of apogee-crypt, apogee-mail, apogee-package, grav-db, grav-orbit.
+
 ## 0.1.0 (2026-11-25)
 
 - Registration, login with a two-factor challenge, logout, password reset by
